@@ -12,6 +12,7 @@ using System.IO;
 using PokemonGo.RocketAPI.Exceptions;
 using GMap.NET.MapProviders;
 using System.Text.RegularExpressions;
+using System.Text;
 
 namespace PokemonGo.RocketAPI.GUI
 {
@@ -23,6 +24,10 @@ namespace PokemonGo.RocketAPI.GUI
         private Settings _settings;
         private Inventory _inventory;
         private GetPlayerResponse _profile;
+
+        // Persisting Pokemon / Storage Sizes
+        private int itemStorageSize;
+        private int pokemonStorageSize;
 
         // Persisting Login Info
         private AuthType _loginMethod;
@@ -88,7 +93,8 @@ namespace PokemonGo.RocketAPI.GUI
 
                 // Begin Process
                 await DisplayLoginWindow();                
-                DisplayPositionSelector();                
+                DisplayPositionSelector();
+                await GetStorageSizes();
                 await GetCurrentPlayerInformation();
                 await PreflightCheck();
 
@@ -206,6 +212,23 @@ namespace PokemonGo.RocketAPI.GUI
                 _profile = await client.GetProfile();
                 EnableButtons();
             }
+            catch (GoogleException ex)
+            {
+                if(ex.Message.Contains("NeedsBrowser"))
+                {
+                    StringBuilder sb = new StringBuilder();
+                    sb.AppendLine("It seems you have Google 2 Factor Authentication enabled.");
+                    sb.AppendLine("In order to enable this bot to access your Google Account you need to create an App Password and use that one instead of your Google Password.");
+                    sb.AppendLine();
+                    sb.AppendLine("Please go to: https://security.google.com/settings/security/apppasswords");                    
+                    sb.AppendLine("In 'Select App' select 'Other' and 'on my' select 'Windows Computer'.");
+                    sb.AppendLine();
+                    sb.AppendLine("This will generate a random password use that password login to the bot.");                    
+                    MessageBox.Show(sb.ToString(), "Google 2 Factor Authentication");
+
+                    Application.Exit();
+                }
+            }
             catch
             {
                 Logger.Write("Unable to Connect using the Google Token.");
@@ -269,24 +292,6 @@ namespace PokemonGo.RocketAPI.GUI
             // Get Pokemons and Inventory
             var myItems = await _inventory.GetItems();
             var myPokemons = await _inventory.GetPokemons();
-
-            // Pokemon / Storage  Upgrades
-            var pokemonStorageUpgradesCount = 0;
-            var itemStorageUpgradesCount = 0;
-
-            var myInventoryUpgrades = await _inventory.GetInventoryUpgrades();
-
-            // Determine the number of upgrades
-            if (myInventoryUpgrades.Count() != 0)
-            {
-                var tmpInventoryUpgrades = myInventoryUpgrades.ToList()[0].ToString();
-                itemStorageUpgradesCount = Regex.Matches(tmpInventoryUpgrades, "1002").Count;
-                pokemonStorageUpgradesCount = Regex.Matches(tmpInventoryUpgrades, "1001").Count;
-            }
-
-            // Calculate storage sizes
-            var itemStorageSize = (itemStorageUpgradesCount * 50) + 350;
-            var pokemonStorageSize = (pokemonStorageUpgradesCount * 50) + 250;
 
             // Write to Console
             var items = myItems as IList<Item> ?? myItems.ToList();
@@ -446,6 +451,27 @@ namespace PokemonGo.RocketAPI.GUI
         // API LOGIC MODULES //
         ///////////////////////
         
+        public async Task GetStorageSizes()
+        {
+            // Pokemon / Storage  Upgrades
+            var pokemonStorageUpgradesCount = 0;
+            var itemStorageUpgradesCount = 0;
+
+            var myInventoryUpgrades = await _inventory.GetInventoryUpgrades();
+
+            // Determine the number of upgrades
+            if (myInventoryUpgrades.Count() != 0)
+            {
+                var tmpInventoryUpgrades = myInventoryUpgrades.ToList()[0].ToString();
+                itemStorageUpgradesCount = Regex.Matches(tmpInventoryUpgrades, "1002").Count;
+                pokemonStorageUpgradesCount = Regex.Matches(tmpInventoryUpgrades, "1001").Count;
+            }
+
+            // Calculate storage sizes
+            itemStorageSize = (itemStorageUpgradesCount * 50) + 350;
+            pokemonStorageSize = (pokemonStorageUpgradesCount * 50) + 250;
+        }
+
         public async Task GetCurrentPlayerInformation()
         {
             var playerName = _profile.Profile.Username ?? "";
@@ -469,8 +495,8 @@ namespace PokemonGo.RocketAPI.GUI
 
             // Write to Console
             var items = myItems as IList<Item> ?? myItems.ToList();
-            boxInventoryCount.Text = $"{items.Select(i => i.Count).Sum()}/350";
-            boxPokemonCount.Text = $"{myPokemons.Count()}/250";
+            boxInventoryCount.Text = $"{items.Select(i => i.Count).Sum()}/{itemStorageSize}";
+            boxPokemonCount.Text = $"{myPokemons.Count()}/{pokemonStorageSize}";
             boxLuckyEggsCount.Text = (items.FirstOrDefault(p => (ItemId)p.Item_ == ItemId.ItemLuckyEgg)?.Count ?? 0).ToString();
             boxIncencesCount.Text = (items.FirstOrDefault(p => (ItemId)p.Item_ == ItemId.ItemIncenseOrdinary)?.Count ?? 0).ToString();            
         }
@@ -891,6 +917,65 @@ namespace PokemonGo.RocketAPI.GUI
             }
         }
 
+
+        private bool ForceUnbanning = false;
+        private bool Stopping = false;
+        private async Task ForceUnban()
+        {
+            if (!ForceUnbanning && !Stopping)
+            {
+                Logger.Write("Waiting for last farming action to be complete...");
+                ForceUnbanning = true;
+
+                while (_isFarmingActive)
+                {
+                    await Task.Delay(25);
+                }
+
+                Logger.Write("Starting force unban...");
+
+                var mapObjects = await _client.GetMapObjects();
+                var pokeStops = mapObjects.MapCells.SelectMany(i => i.Forts).Where(i => i.Type == FortType.Checkpoint && i.CooldownCompleteTimestampMs < DateTime.UtcNow.ToUnixTime());
+
+                await Task.Delay(10000);
+                bool done = false;
+
+                foreach (var pokeStop in pokeStops)
+                {
+                    var fortInfo = await _client.GetFort(pokeStop.Id, pokeStop.Latitude, pokeStop.Longitude);
+
+                    if (fortInfo.Name != string.Empty)
+                    {
+                        Logger.Write("Chosen PokeStop " + fortInfo.Name + " for force unban");
+                        for (int i = 1; i <= 50; i++)
+                        {
+                            var fortSearch = await _client.SearchFort(pokeStop.Id, pokeStop.Latitude, pokeStop.Longitude);
+                            if (fortSearch.ExperienceAwarded == 0)
+                            {
+                                Logger.Write("Attempt: " + i);
+                            }
+                            else
+                            {
+                                Logger.Write("You are now unbanned! Total attempts: " + i);
+                                done = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!done)
+                        Logger.Write("Force unban failed, please try again.");
+
+                    ForceUnbanning = false;
+                    break;
+                }
+            }
+            else
+            {
+                Logger.Write("A action is in play... Please wait.");
+            }
+        }
+
         private void exitToolStripMenuItem_Click(object sender, EventArgs e)
         {
             var confirm = MessageBox.Show("Do you want to close the bot?", "PoGo Bot", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
@@ -1010,6 +1095,11 @@ namespace PokemonGo.RocketAPI.GUI
             MessageBox.Show("PoGo Bot SimpleGUI is an Open Source Project Created by Jorge Limas." + Environment.NewLine + Environment.NewLine +
                 "You can get the latest version for FREE at:" + Environment.NewLine + 
                 "https://github.com/Novalys/PokemonGo-Bot-SimpleGUI", "PoGo Bot");
+        }
+
+        private async void forceRemoveBanToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            await ForceUnban();
         }
     }
 }
